@@ -1369,12 +1369,29 @@ struct NVGPUWarpgroupMmaOpLowering
     ///               |  |  |  |  |
     ///               +-----------+
     ///
+    // NOVA PATCH (2026-09-07): row-major was this function's only case, and it
+    // silently mis-tracks an MN-major A (Nova's matmul_transpose_a / TN path,
+    // which flags transposeA and stores A with M contiguous rather than K).
+    // For an MN-major operand, K is the STRIDED axis: hopping wgmmaK elements
+    // along it is not a `wgmmaK*byte`-sized jump through contiguous memory,
+    // it is a jump of one full swizzle atom (SwizzleBytes), independent of
+    // wgmmaK/element width -- see the hardware-validated reference's
+    // `gmma_desc_advance_mn_k16` (Bgemm_sm90_warpspecialized_template.cuh),
+    // which literally adds SwizzleBytes to the encoded descriptor per K-step.
+    // 128 is hardcoded because Nova's descriptor builder only ever emits
+    // SWIZZLE_128B tensor maps (NovaGPUWgmmaPatterns.cpp, getOrCreateDescriptor).
     Value iterateDescriptorA(Value desc, int i, int j, int k) {
       MemRefType matrixTypeA = op.getDescriptorA().getType().getTensor();
       Type elemA = matrixTypeA.getElementType();
       int byte = elemA.getIntOrFloatBitWidth() / 8;
-      int tileShapeA = matrixTypeA.getDimSize(1);
-      int incrementVal = ((wgmmaK * k) + (totalK * tileShapeA * i)) * byte;
+      int incrementVal;
+      if (op.getTransposeA()) {
+        constexpr int kNovaSwizzleBytes128 = 128;
+        incrementVal = k * kNovaSwizzleBytes128 * 16;
+      } else {
+        int tileShapeA = matrixTypeA.getDimSize(1);
+        incrementVal = ((wgmmaK * k) + (totalK * tileShapeA * i)) * byte;
+      }
       incrementVal = incrementVal >> exclude4LSB;
       LLVM_DEBUG(DBGS() << "\t\t[m: " << i << " n: " << j << " k: " << k
                         << "] [wgmma descriptors] Descriptor A + "
@@ -1395,11 +1412,33 @@ struct NVGPUWarpgroupMmaOpLowering
     ///                |↓ |  |  |  |  |  |  |  |
     ///                +--+--+--+--+--+--+--+--+
     ///
+    // NOVA PATCH (2026-09-07, revised): the mirror image of iterateDescriptorA's
+    // patch. Originally this branch kept the ORIGINAL formula
+    // (`matrixTypeB.getDimSize(0) * wgmmaK * k * byte`) for MN-major B, on the
+    // theory that it was already correct there (Nova's NN/TN paths). It is not
+    // shape-invariant: it only reduces to the right `k*SwizzleBytes` step when
+    // the K-tile happens to be exactly one 128B swizzle atom wide
+    // (K_tile*elemBytes == 128, e.g. K_tile=64 at bf16) -- at a smaller K-tile
+    // (e.g. K_tile=32, measured on a 4x256x256x512 shape) it silently computes
+    // HALF the correct step, corrupting dW as soon as iterationK > 1. Fixed to
+    // the same flat, tile-size-independent constant as A's MN-major branch:
+    // one swizzle atom (128 B) per k16 step, regardless of K_tile -- matching
+    // `gmma_desc_advance_mn_k16` in the hardware-validated reference exactly.
+    //
+    // Nova's NT path stores B K-major (transposeB clear) instead, where K is
+    // CONTIGUOUS and the correct per-step hop is the small `wgmmaK*byte` jump,
+    // same as an ordinary K-major A.
     Value iterateDescriptorB(Value desc, int i, int j, int k) {
       MemRefType matrixTypeB = op.getDescriptorB().getType().getTensor();
       Type elemB = matrixTypeB.getElementType();
       int byte = elemB.getIntOrFloatBitWidth() / 8;
-      int incrementVal = matrixTypeB.getDimSize(0) * wgmmaK * k * byte;
+      int incrementVal;
+      if (op.getTransposeB()) {
+        constexpr int kNovaSwizzleBytes128 = 128;
+        incrementVal = k * kNovaSwizzleBytes128 * 16;
+      } else {
+        incrementVal = wgmmaK * k * byte;
+      }
       incrementVal = incrementVal >> exclude4LSB;
       LLVM_DEBUG(DBGSE() << "Descriptor B + " << incrementVal << "\n");
       if (!incrementVal)

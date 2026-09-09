@@ -371,13 +371,35 @@ std::optional<InFlightDiagnostic> verifyTmaDescriptorWithMemref(
   }
   if (descMemref.getRank() > 1 &&
       descType.getSwizzle() != TensorMapSwizzleKind::SWIZZLE_NONE) {
+    // Per the CUDA driver API (cuTensorMapEncodeTiled), the bounding-box
+    // inner dimension in bytes must not exceed the selected swizzle size --
+    // 128/64/32 bytes for SWIZZLE_128B/64B/32B respectively -- not always
+    // exactly 128 regardless of swizzle kind. The previous unconditional
+    // "!= 128" check rejected perfectly valid narrower boxes (e.g. a 64-byte
+    // box under SWIZZLE_64B).
+    unsigned swizzleBytes;
+    switch (descType.getSwizzle()) {
+    case TensorMapSwizzleKind::SWIZZLE_32B:
+      swizzleBytes = 32;
+      break;
+    case TensorMapSwizzleKind::SWIZZLE_64B:
+      swizzleBytes = 64;
+      break;
+    case TensorMapSwizzleKind::SWIZZLE_128B:
+      swizzleBytes = kMaxTMALastdimByte;
+      break;
+    default:
+      swizzleBytes = kMaxTMALastdimByte;
+      break;
+    }
     unsigned lastDimensionByte =
         descMemref.getElementTypeBitWidth() * descMemref.getShape().back() / 8;
-    if (lastDimensionByte != kMaxTMALastdimByte)
-      return op->emitError() << "the tensormap descriptor must have last "
-                                "dimension of "
-                             << kMaxTMALastdimByte << " bytes but it is "
-                             << lastDimensionByte << " bytes";
+    if (lastDimensionByte > swizzleBytes)
+      return op->emitError() << "the tensormap descriptor's last dimension ("
+                             << lastDimensionByte
+                             << " bytes) must not exceed the selected "
+                                "swizzle size ("
+                             << swizzleBytes << " bytes)";
   }
 
   // No verification if memref type is not provided
@@ -477,12 +499,26 @@ LogicalResult WarpgroupGenerateDescriptorOp::verify() {
   if (error.has_value())
     return error.value();
 
-  if (getTensorMap().getType().getSwizzle() !=
-      TensorMapSwizzleKind::SWIZZLE_128B) {
+  // WarpgroupGenerateDescriptorOpLowering (NVGPUToNVVM.cpp) computes the
+  // wgmma matrix descriptor's swizzle/layout fields generically from the
+  // tensor map's swizzle kind (128B/64B/32B all map to real, distinct
+  // hardware encodings of the descriptor's swizzle-type field) -- there is
+  // no lowering-side reason to restrict this to 128B only. SWIZZLE_NONE is
+  // excluded here because the lowering's `layout` for it (1 byte) makes
+  // leadDimVal/strideDimVal degenerate, which was never exercised/validated.
+  TensorMapSwizzleKind swizzle = getTensorMap().getType().getSwizzle();
+  if (swizzle != TensorMapSwizzleKind::SWIZZLE_128B &&
+      swizzle != TensorMapSwizzleKind::SWIZZLE_64B &&
+      swizzle != TensorMapSwizzleKind::SWIZZLE_32B) {
     return emitError() << "supports only "
                        << stringifyTensorMapSwizzleKind(
                               TensorMapSwizzleKind::SWIZZLE_128B)
-                       << " is supported for the time being";
+                       << ", "
+                       << stringifyTensorMapSwizzleKind(
+                              TensorMapSwizzleKind::SWIZZLE_64B)
+                       << " or "
+                       << stringifyTensorMapSwizzleKind(
+                              TensorMapSwizzleKind::SWIZZLE_32B);
   }
 
   if (getTensorMap().getType().getInterleave() !=
