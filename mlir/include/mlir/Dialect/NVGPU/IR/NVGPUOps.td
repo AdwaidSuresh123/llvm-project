@@ -624,11 +624,15 @@ def NVGPU_WarpgroupMmaStoreOp : NVGPU_Op<"warpgroup.mma.store"> {
     (https://docs.nvidia.com/cuda/parallel-thread-execution/index.html#wgmma-64n16-d) 
 
     Note that, the op must be run with warp group.
+
+    `accumulate`, if set, adds the fragmented result onto the existing
+    `dstMemref` value instead of overwriting it.
   }];
 
   let arguments = (ins NVGPU_WarpgroupAccumulator:$matrixD,
-                       Arg<AnyMemRef, "", [MemWrite]>:$dstMemref);
-  
+                       Arg<AnyMemRef, "", [MemRead, MemWrite]>:$dstMemref,
+                       UnitAttr:$accumulate);
+
   let assemblyFormat = [{
     $matrixD `,` $dstMemref attr-dict `:` type($matrixD) `to` type($dstMemref)
   }];

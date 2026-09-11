@@ -371,12 +371,8 @@ std::optional<InFlightDiagnostic> verifyTmaDescriptorWithMemref(
   }
   if (descMemref.getRank() > 1 &&
       descType.getSwizzle() != TensorMapSwizzleKind::SWIZZLE_NONE) {
-    // Per the CUDA driver API (cuTensorMapEncodeTiled), the bounding-box
-    // inner dimension in bytes must not exceed the selected swizzle size --
-    // 128/64/32 bytes for SWIZZLE_128B/64B/32B respectively -- not always
-    // exactly 128 regardless of swizzle kind. The previous unconditional
-    // "!= 128" check rejected perfectly valid narrower boxes (e.g. a 64-byte
-    // box under SWIZZLE_64B).
+    // Per cuTensorMapEncodeTiled, the bounding-box inner dimension must not
+    // exceed the selected swizzle size (128/64/32 bytes), not always 128.
     unsigned swizzleBytes;
     switch (descType.getSwizzle()) {
     case TensorMapSwizzleKind::SWIZZLE_32B:
@@ -499,13 +495,9 @@ LogicalResult WarpgroupGenerateDescriptorOp::verify() {
   if (error.has_value())
     return error.value();
 
-  // WarpgroupGenerateDescriptorOpLowering (NVGPUToNVVM.cpp) computes the
-  // wgmma matrix descriptor's swizzle/layout fields generically from the
-  // tensor map's swizzle kind (128B/64B/32B all map to real, distinct
-  // hardware encodings of the descriptor's swizzle-type field) -- there is
-  // no lowering-side reason to restrict this to 128B only. SWIZZLE_NONE is
-  // excluded here because the lowering's `layout` for it (1 byte) makes
-  // leadDimVal/strideDimVal degenerate, which was never exercised/validated.
+  // The lowering derives the descriptor's swizzle/layout fields generically
+  // from the tensor map's swizzle kind, so 64B/32B are as valid as 128B.
+  // SWIZZLE_NONE is excluded: its degenerate 1-byte layout is unsupported.
   TensorMapSwizzleKind swizzle = getTensorMap().getType().getSwizzle();
   if (swizzle != TensorMapSwizzleKind::SWIZZLE_128B &&
       swizzle != TensorMapSwizzleKind::SWIZZLE_64B &&

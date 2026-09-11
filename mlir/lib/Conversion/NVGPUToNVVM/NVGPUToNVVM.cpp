@@ -1369,17 +1369,9 @@ struct NVGPUWarpgroupMmaOpLowering
     ///               |  |  |  |  |
     ///               +-----------+
     ///
-    // NOVA PATCH (2026-09-07): row-major was this function's only case, and it
-    // silently mis-tracks an MN-major A (Nova's matmul_transpose_a / TN path,
-    // which flags transposeA and stores A with M contiguous rather than K).
-    // For an MN-major operand, K is the STRIDED axis: hopping wgmmaK elements
-    // along it is not a `wgmmaK*byte`-sized jump through contiguous memory,
-    // it is a jump of one full swizzle atom (SwizzleBytes), independent of
-    // wgmmaK/element width -- see the hardware-validated reference's
-    // `gmma_desc_advance_mn_k16` (Bgemm_sm90_warpspecialized_template.cuh),
-    // which literally adds SwizzleBytes to the encoded descriptor per K-step.
-    // 128 is hardcoded because Nova's descriptor builder only ever emits
-    // SWIZZLE_128B tensor maps (NovaGPUWgmmaPatterns.cpp, getOrCreateDescriptor).
+    // For a transposed (MN-major) A, K is the strided axis: the correct
+    // per-step hop is one 128B swizzle atom, not `wgmmaK*byte`. Matches
+    // CUTLASS's `gmma_desc_advance_mn_k16`.
     Value iterateDescriptorA(Value desc, int i, int j, int k) {
       MemRefType matrixTypeA = op.getDescriptorA().getType().getTensor();
       Type elemA = matrixTypeA.getElementType();
@@ -1412,22 +1404,10 @@ struct NVGPUWarpgroupMmaOpLowering
     ///                |↓ |  |  |  |  |  |  |  |
     ///                +--+--+--+--+--+--+--+--+
     ///
-    // NOVA PATCH (2026-09-07, revised): the mirror image of iterateDescriptorA's
-    // patch. Originally this branch kept the ORIGINAL formula
-    // (`matrixTypeB.getDimSize(0) * wgmmaK * k * byte`) for MN-major B, on the
-    // theory that it was already correct there (Nova's NN/TN paths). It is not
-    // shape-invariant: it only reduces to the right `k*SwizzleBytes` step when
-    // the K-tile happens to be exactly one 128B swizzle atom wide
-    // (K_tile*elemBytes == 128, e.g. K_tile=64 at bf16) -- at a smaller K-tile
-    // (e.g. K_tile=32, measured on a 4x256x256x512 shape) it silently computes
-    // HALF the correct step, corrupting dW as soon as iterationK > 1. Fixed to
-    // the same flat, tile-size-independent constant as A's MN-major branch:
-    // one swizzle atom (128 B) per k16 step, regardless of K_tile -- matching
-    // `gmma_desc_advance_mn_k16` in the hardware-validated reference exactly.
-    //
-    // Nova's NT path stores B K-major (transposeB clear) instead, where K is
-    // CONTIGUOUS and the correct per-step hop is the small `wgmmaK*byte` jump,
-    // same as an ordinary K-major A.
+    // Mirrors iterateDescriptorA: for a transposed (MN-major) B, advance by
+    // one 128B swizzle atom per k16 step rather than `tileN*wgmmaK*byte`,
+    // which only happened to be correct when K_tile*elemBytes == 128 and
+    // silently under-advanced (corrupting results) at narrower K tiles.
     Value iterateDescriptorB(Value desc, int i, int j, int k) {
       MemRefType matrixTypeB = op.getDescriptorB().getType().getTensor();
       Type elemB = matrixTypeB.getElementType();
@@ -1560,6 +1540,28 @@ struct NVGPUWarpgroupMmaOpLowering
   }
 };
 
+/// f32 -> bf16 (round-to-nearest-even) via integer bit manipulation rather
+/// than `LLVM::FPTruncOp`. NVPTX codegen's SLP vectorizer re-fuses adjacent
+/// scalar truncf ops (as emitted here, two per iteration) into a 2-wide
+/// vector truncation that is known to miscompile on this target. bf16 is
+/// simply the upper 16 bits of an f32, so the conversion reduces to a shift
+/// and a rounding add, avoiding any float-narrowing instruction altogether.
+static Value truncF32ToBf16(ImplicitLocOpBuilder &b, Value f32Val,
+                            Type bf16Ty) {
+  Type i32 = b.getI32Type();
+  auto cI32 = [&](int32_t v) -> Value {
+    return b.create<LLVM::ConstantOp>(i32, b.getI32IntegerAttr(v));
+  };
+  Value bits = b.create<LLVM::BitcastOp>(i32, f32Val);
+  Value hiBit = b.create<LLVM::LShrOp>(i32, bits, cI32(16));
+  Value lsb = b.create<LLVM::AndOp>(i32, hiBit, cI32(1));
+  Value bias = b.create<LLVM::AddOp>(i32, cI32(0x7fff), lsb);
+  Value rounded = b.create<LLVM::AddOp>(i32, bits, bias);
+  Value hi16 = b.create<LLVM::LShrOp>(i32, rounded, cI32(16));
+  Value narrow = b.create<LLVM::TruncOp>(b.getI16Type(), hi16);
+  return b.create<LLVM::BitcastOp>(bf16Ty, narrow);
+}
+
 struct NVGPUWarpgroupMmaStoreOpLowering
     : public ConvertOpToLLVMPattern<nvgpu::WarpgroupMmaStoreOp> {
   using ConvertOpToLLVMPattern<
@@ -1601,9 +1603,15 @@ struct NVGPUWarpgroupMmaStoreOpLowering
   /// \param dstMemref: The memref where the registers will be stored.
   /// \param offset: the offset within the memref where the registers will be
   /// stored.
+  /// \param dstElemTy: destination element type, f32 or bf16 (converted via
+  /// `truncF32ToBf16`).
+  /// \param accumulate: if set, read-modify-write instead of overwrite (dst
+  /// += frag) — see the op's `accumulate` attribute. Safe without
+  /// synchronization: each destination element is owned by exactly one
+  /// lane.
   void storeFragmentedMatrix(ImplicitLocOpBuilder &b, Value matrixD,
-                             TypedValue<MemRefType> dstMemref,
-                             int offset) const {
+                             TypedValue<MemRefType> dstMemref, int offset,
+                             Type dstElemTy, bool accumulate) const {
     Type i32 = b.getI32Type();
 
     auto makeConst = [&](int32_t index) -> Value {
@@ -1623,6 +1631,22 @@ struct NVGPUWarpgroupMmaStoreOpLowering
       return b.create<LLVM::AddOp>(lhs.getType(), lhs, rhs);
     };
 
+    // One accumulator register -> one destination element. `frag` is f32;
+    // the destination may be f32 or bf16, and may need the old value folded
+    // in (accumulate).
+    auto emitElement = [&](Value frag, Value idx, Value idy,
+                           TypedValue<::mlir::MemRefType> memref) {
+      Value v = frag;
+      if (accumulate) {
+        Value old = b.create<memref::LoadOp>(memref, ValueRange{idx, idy});
+        if (!dstElemTy.isF32())
+          old = b.create<arith::ExtFOp>(b.getF32Type(), old);
+        v = b.create<arith::AddFOp>(v, old);
+      }
+      Value out = dstElemTy.isF32() ? v : truncF32ToBf16(b, v, dstElemTy);
+      b.create<memref::StoreOp>(out, memref, ValueRange{idx, idy});
+    };
+
     auto makeExtractAndStore = [&](int i, Value wgmmaResult, Value x, Value y,
                                    TypedValue<::mlir::MemRefType> memref) {
       Type it = b.getIndexType();
@@ -1631,8 +1655,8 @@ struct NVGPUWarpgroupMmaStoreOpLowering
       Value idy1 = b.create<arith::IndexCastOp>(it, makeAdd(y, c1));
       Value d0 = b.create<LLVM::ExtractValueOp>(wgmmaResult, i);
       Value d1 = b.create<LLVM::ExtractValueOp>(wgmmaResult, i + 1);
-      b.create<memref::StoreOp>(d0, memref, ValueRange{idx, idy0});
-      b.create<memref::StoreOp>(d1, memref, ValueRange{idx, idy1});
+      emitElement(d0, idx, idy0, memref);
+      emitElement(d1, idx, idy1, memref);
     };
 
     Value tidx = b.create<NVVM::ThreadIdXOp>(i32);
@@ -1670,6 +1694,16 @@ struct NVGPUWarpgroupMmaStoreOpLowering
   LogicalResult
   matchAndRewrite(nvgpu::WarpgroupMmaStoreOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    Type dstElemTy = op.getDstMemref().getType().getElementType();
+    // The bf16 bit-trick is specific to bf16's exponent layout and would be
+    // wrong for f16 or any other narrower type; only f32 (as-is) and bf16
+    // (converted in registers) destinations are supported.
+    if (!dstElemTy.isF32() && !dstElemTy.isBF16())
+      return rewriter.notifyMatchFailure(
+          op, "unsupported destination element type for wgmma store");
+
+    bool accumulate = op.getAccumulate();
+
     int offset = 0;
     ImplicitLocOpBuilder b(op->getLoc(), rewriter);
     Value matriDValue = adaptor.getMatrixD();
@@ -1677,7 +1711,8 @@ struct NVGPUWarpgroupMmaStoreOpLowering
     for (auto [idx, matrixD] : llvm::enumerate(stype.getBody())) {
       auto structType = cast<LLVM::LLVMStructType>(matrixD);
       Value innerStructValue = b.create<LLVM::ExtractValueOp>(matriDValue, idx);
-      storeFragmentedMatrix(b, innerStructValue, op.getDstMemref(), offset);
+      storeFragmentedMatrix(b, innerStructValue, op.getDstMemref(), offset,
+                           dstElemTy, accumulate);
       offset += structType.getBody().size();
     }
     rewriter.eraseOp(op);
