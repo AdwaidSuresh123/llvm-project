@@ -3821,7 +3821,11 @@ public:
 ///   %result = vector.from_elements %c1, %c2 : vector<2xi32>
 class InsertChainFullyInitialized final : public OpRewritePattern<InsertOp> {
 public:
-  using Base::Base;
+  InsertChainFullyInitialized(MLIRContext *context, PatternBenefit benefit = 1)
+      : OpRewritePattern<InsertOp>(context, benefit) {
+    setDebugName("InsertChainFullyInitialized");
+  }
+
   LogicalResult matchAndRewrite(InsertOp op,
                                 PatternRewriter &rewriter) const override {
 
