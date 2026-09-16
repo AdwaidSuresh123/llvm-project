@@ -1329,12 +1329,21 @@ struct NVGPUWarpgroupMmaOpLowering
     ///               |  |  |  |  |
     ///               +-----------+
     ///
+    // For a transposed (MN-major) A, K is the strided axis: the correct
+    // per-step hop is one 128B swizzle atom, not `wgmmaK*byte`. Matches
+    // CUTLASS's `gmma_desc_advance_mn_k16`.
     Value iterateDescriptorA(Value desc, int i, int j, int k) {
       MemRefType matrixTypeA = op.getDescriptorA().getType().getTensor();
       Type elemA = matrixTypeA.getElementType();
       int byte = elemA.getIntOrFloatBitWidth() / 8;
-      int tileShapeA = matrixTypeA.getDimSize(1);
-      int incrementVal = ((wgmmaK * k) + (totalK * tileShapeA * i)) * byte;
+      int incrementVal;
+      if (op.getTransposeA()) {
+        constexpr int kNovaSwizzleBytes128 = 128;
+        incrementVal = k * kNovaSwizzleBytes128 * 16;
+      } else {
+        int tileShapeA = matrixTypeA.getDimSize(1);
+        incrementVal = ((wgmmaK * k) + (totalK * tileShapeA * i)) * byte;
+      }
       incrementVal = incrementVal >> exclude4LSB;
       LDBG() << "\t\t[m: " << i << " n: " << j << " k: " << k
              << "] [wgmma descriptors] Descriptor A + " << incrementVal
@@ -1355,11 +1364,21 @@ struct NVGPUWarpgroupMmaOpLowering
     ///                |↓ |  |  |  |  |  |  |  |
     ///                +--+--+--+--+--+--+--+--+
     ///
+    // Mirrors iterateDescriptorA: for a transposed (MN-major) B, advance by
+    // one 128B swizzle atom per k16 step rather than `tileN*wgmmaK*byte`,
+    // which only happened to be correct when K_tile*elemBytes == 128 and
+    // silently under-advanced (corrupting results) at narrower K tiles.
     Value iterateDescriptorB(Value desc, int i, int j, int k) {
       MemRefType matrixTypeB = op.getDescriptorB().getType().getTensor();
       Type elemB = matrixTypeB.getElementType();
       int byte = elemB.getIntOrFloatBitWidth() / 8;
-      int incrementVal = matrixTypeB.getDimSize(0) * wgmmaK * k * byte;
+      int incrementVal;
+      if (op.getTransposeB()) {
+        constexpr int kNovaSwizzleBytes128 = 128;
+        incrementVal = k * kNovaSwizzleBytes128 * 16;
+      } else {
+        incrementVal = wgmmaK * k * byte;
+      }
       incrementVal = incrementVal >> exclude4LSB;
       LDBG() << "Descriptor B + " << incrementVal;
       if (!incrementVal)
