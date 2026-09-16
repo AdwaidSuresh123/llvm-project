@@ -396,12 +396,17 @@ std::optional<InFlightDiagnostic> verifyTmaDescriptorWithMemref(
       descType.getSwizzle() != TensorMapSwizzleKind::SWIZZLE_NONE) {
     unsigned lastDimensionByte =
         descMemref.getElementTypeBitWidth() * descMemref.getShape().back() / 8;
-    unsigned expectByte = getSwizzleBytes(descType.getSwizzle());
-    if (lastDimensionByte != expectByte)
-      return op->emitError() << "the tensormap descriptor must have last "
-                                "dimension of "
-                             << expectByte << " bytes but it is "
-                             << lastDimensionByte << " bytes";
+    // Per cuTensorMapEncodeTiled the bounding-box inner dimension must not
+    // EXCEED the selected swizzle size; it need not equal it. Requiring
+    // equality rejects otherwise valid narrow-K tiles (e.g. a 64-byte inner
+    // dimension under a 128B swizzle).
+    unsigned swizzleBytes = getSwizzleBytes(descType.getSwizzle());
+    if (lastDimensionByte > swizzleBytes)
+      return op->emitError() << "the tensormap descriptor's last dimension ("
+                             << lastDimensionByte
+                             << " bytes) must not exceed the selected "
+                                "swizzle size ("
+                             << swizzleBytes << " bytes)";
   }
 
   // No verification if memref type is not provided
@@ -507,12 +512,22 @@ LogicalResult WarpgroupGenerateDescriptorOp::verify() {
   if (error.has_value())
     return error.value();
 
-  if (getTensorMap().getType().getSwizzle() !=
-      TensorMapSwizzleKind::SWIZZLE_128B) {
+  // The lowering derives the descriptor's swizzle/layout fields generically
+  // from the tensor map's swizzle kind, so 64B/32B are as valid as 128B.
+  // SWIZZLE_NONE is excluded: its degenerate 1-byte layout is unsupported.
+  TensorMapSwizzleKind swizzle = getTensorMap().getType().getSwizzle();
+  if (swizzle != TensorMapSwizzleKind::SWIZZLE_128B &&
+      swizzle != TensorMapSwizzleKind::SWIZZLE_64B &&
+      swizzle != TensorMapSwizzleKind::SWIZZLE_32B) {
     return emitError() << "supports only "
                        << stringifyTensorMapSwizzleKind(
                               TensorMapSwizzleKind::SWIZZLE_128B)
-                       << " is supported for the time being";
+                       << ", "
+                       << stringifyTensorMapSwizzleKind(
+                              TensorMapSwizzleKind::SWIZZLE_64B)
+                       << " or "
+                       << stringifyTensorMapSwizzleKind(
+                              TensorMapSwizzleKind::SWIZZLE_32B);
   }
 
   if (getTensorMap().getType().getInterleave() !=
