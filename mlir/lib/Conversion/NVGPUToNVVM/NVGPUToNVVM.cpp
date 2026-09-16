@@ -1479,6 +1479,31 @@ struct NVGPUWarpgroupMmaOpLowering
   }
 };
 
+/// f32 -> bf16 (round-to-nearest-even) via integer bit manipulation rather
+/// than `LLVM::FPTruncOp`. NVPTX codegen's SLP vectorizer re-fuses adjacent
+/// scalar truncf ops (as emitted here, two per iteration) into a 2-wide
+/// vector truncation that is known to miscompile on this target. bf16 is
+/// simply the upper 16 bits of an f32, so the conversion reduces to a shift
+/// and a rounding add, avoiding any float-narrowing instruction altogether.
+///
+/// TODO: revisit on each LLVM bump -- once the NVPTX SLP miscompile is fixed
+/// upstream this should go back to a plain LLVM::FPTruncOp.
+static Value truncF32ToBf16(ImplicitLocOpBuilder &b, Value f32Val,
+                            Type bf16Ty) {
+  Type i32 = b.getI32Type();
+  auto cI32 = [&](int32_t v) -> Value {
+    return LLVM::ConstantOp::create(b, i32, b.getI32IntegerAttr(v));
+  };
+  Value bits = LLVM::BitcastOp::create(b, i32, f32Val);
+  Value hiBit = LLVM::LShrOp::create(b, i32, bits, cI32(16));
+  Value lsb = LLVM::AndOp::create(b, i32, hiBit, cI32(1));
+  Value bias = LLVM::AddOp::create(b, i32, cI32(0x7fff), lsb);
+  Value rounded = LLVM::AddOp::create(b, i32, bits, bias);
+  Value hi16 = LLVM::LShrOp::create(b, i32, rounded, cI32(16));
+  Value narrow = LLVM::TruncOp::create(b, b.getI16Type(), hi16);
+  return LLVM::BitcastOp::create(b, bf16Ty, narrow);
+}
+
 struct NVGPUWarpgroupMmaStoreOpLowering
     : public ConvertOpToLLVMPattern<nvgpu::WarpgroupMmaStoreOp> {
   using ConvertOpToLLVMPattern<
@@ -1520,9 +1545,14 @@ struct NVGPUWarpgroupMmaStoreOpLowering
   /// \param dstMemref: The memref where the registers will be stored.
   /// \param offset: the offset within the memref where the registers will be
   /// stored.
+  /// \param dstElemTy: destination element type, f32 or bf16 (converted via
+  /// `truncF32ToBf16`).
+  /// \param accumulate: if set, read-modify-write instead of overwrite (dst
+  /// += frag) -- see the op's `accumulate` attribute. Safe without
+  /// synchronization: each destination element is owned by exactly one lane.
   void storeFragmentedMatrix(ImplicitLocOpBuilder &b, Value matrixD,
-                             TypedValue<MemRefType> dstMemref,
-                             int offset) const {
+                             TypedValue<MemRefType> dstMemref, int offset,
+                             Type dstElemTy, bool accumulate) const {
     Type i32 = b.getI32Type();
 
     auto makeConst = [&](int32_t index) -> Value {
@@ -1542,6 +1572,22 @@ struct NVGPUWarpgroupMmaStoreOpLowering
       return LLVM::AddOp::create(b, lhs.getType(), lhs, rhs);
     };
 
+    // One accumulator register -> one destination element. `frag` is f32;
+    // the destination may be f32 or bf16, and may need the old value folded
+    // in (accumulate).
+    auto emitElement = [&](Value frag, Value idx, Value idy,
+                           TypedValue<::mlir::MemRefType> memref) {
+      Value v = frag;
+      if (accumulate) {
+        Value old = memref::LoadOp::create(b, memref, ValueRange{idx, idy});
+        if (!dstElemTy.isF32())
+          old = arith::ExtFOp::create(b, b.getF32Type(), old);
+        v = arith::AddFOp::create(b, v, old);
+      }
+      Value out = dstElemTy.isF32() ? v : truncF32ToBf16(b, v, dstElemTy);
+      memref::StoreOp::create(b, out, memref, ValueRange{idx, idy});
+    };
+
     auto makeExtractAndStore = [&](int i, Value wgmmaResult, Value x, Value y,
                                    TypedValue<::mlir::MemRefType> memref) {
       Type it = b.getIndexType();
@@ -1550,8 +1596,8 @@ struct NVGPUWarpgroupMmaStoreOpLowering
       Value idy1 = arith::IndexCastOp::create(b, it, makeAdd(y, c1));
       Value d0 = LLVM::ExtractValueOp::create(b, wgmmaResult, i);
       Value d1 = LLVM::ExtractValueOp::create(b, wgmmaResult, i + 1);
-      memref::StoreOp::create(b, d0, memref, ValueRange{idx, idy0});
-      memref::StoreOp::create(b, d1, memref, ValueRange{idx, idy1});
+      emitElement(d0, idx, idy0, memref);
+      emitElement(d1, idx, idy1, memref);
     };
 
     Value tidx = NVVM::ThreadIdXOp::create(b, i32);
@@ -1589,6 +1635,16 @@ struct NVGPUWarpgroupMmaStoreOpLowering
   LogicalResult
   matchAndRewrite(nvgpu::WarpgroupMmaStoreOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    Type dstElemTy = op.getDstMemref().getType().getElementType();
+    // The bf16 bit-trick is specific to bf16's exponent layout and would be
+    // wrong for f16 or any other narrower type; only f32 (as-is) and bf16
+    // (converted in registers) destinations are supported.
+    if (!dstElemTy.isF32() && !dstElemTy.isBF16())
+      return rewriter.notifyMatchFailure(
+          op, "unsupported destination element type for wgmma store");
+
+    bool accumulate = op.getAccumulate();
+
     int offset = 0;
     ImplicitLocOpBuilder b(op->getLoc(), rewriter);
     Value matriDValue = adaptor.getMatrixD();
@@ -1597,7 +1653,8 @@ struct NVGPUWarpgroupMmaStoreOpLowering
       auto structType = cast<LLVM::LLVMStructType>(matrixD);
       Value innerStructValue =
           LLVM::ExtractValueOp::create(b, matriDValue, idx);
-      storeFragmentedMatrix(b, innerStructValue, op.getDstMemref(), offset);
+      storeFragmentedMatrix(b, innerStructValue, op.getDstMemref(), offset,
+                            dstElemTy, accumulate);
       offset += structType.getBody().size();
     }
     rewriter.eraseOp(op);
