@@ -704,6 +704,39 @@ NVPTXSerializer::moduleToObject(llvm::Module &llvmModule) {
       "The `NVPTX` target was not built. Please enable it when building LLVM.");
 #endif // LLVM_HAS_NVPTX_TARGET
 
+  // Materialise the target's `ftz` flag as the LLVM function attribute the
+  // backend actually reads.
+  //
+  // NVVMTargetAttr carries `ftz` (and `fast`) in its flags dict, and until now
+  // nothing translated them onto the LLVM functions — NVVMTargetAttr::hasFtz()
+  // had no callers at all. Anything in the backend that asks the *function*
+  // about denormals therefore saw the default IEEE mode, no matter what the
+  // target requested.
+  //
+  // NVPTXTargetLowering::shouldExpandAtomicRMWInIR is the case that bites:
+  // PTX atom.add.f32 always flushes denormals on global memory, so it emits
+  // the native instruction only for an FTZ function and otherwise expands to
+  // a compare-and-swap retry loop. A kernel compiled with `ftz` requested but
+  // not recorded gets the CAS loop, which serialises every contended address.
+  //
+  // PreserveSign is the denormal mode PTX .ftz implements: flush to zero, keep
+  // the sign. Set for both the default and the f32 mode, and written on each
+  // function rather than the module because that is where
+  // Function::getDenormalMode looks.
+  if (getTarget().hasFtz()) {
+    for (llvm::Function &f : llvmModule.functions()) {
+      if (f.isDeclaration())
+        continue;
+      if (f.hasFnAttribute(llvm::Attribute::DenormalFPEnv))
+        continue;
+      llvm::AttrBuilder ab(llvmModule.getContext());
+      ab.addDenormalFPEnvAttr(
+          llvm::DenormalFPEnv(llvm::DenormalMode::getPreserveSign(),
+                              llvm::DenormalMode::getPreserveSign()));
+      f.addFnAttrs(ab);
+    }
+  }
+
   // Emit PTX code.
   FailureOr<llvm::TargetMachine *> targetMachine = getOrCreateTargetMachine();
   if (failed(targetMachine))
