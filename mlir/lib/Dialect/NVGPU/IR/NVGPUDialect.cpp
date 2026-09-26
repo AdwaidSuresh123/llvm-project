@@ -692,6 +692,26 @@ LogicalResult WarpgroupMmaInitAccumulatorOp::verify() {
                             "level (wgmma) matrix multiplication instruction "
                             "(or not supported yet)";
   }
+
+  // Seeded form: the source is read through the very same fragment mapping the
+  // matching warpgroup.mma.store writes through, so it has to match the
+  // accumulator element for element -- the lowering has no way to shift, pad or
+  // broadcast it.
+  if (TypedValue<MemRefType> src = getSrcMemref()) {
+    MemRefType srcType = src.getType();
+    Type srcElemType = srcType.getElementType();
+    if (!srcElemType.isF32() && !srcElemType.isBF16())
+      return emitOpError() << "seeds from " << srcElemType
+                           << ". Only f32 and bf16 sources are supported";
+    if (srcType.getRank() != 2)
+      return emitOpError() << "seeds from a rank-" << srcType.getRank()
+                           << " memref. The fragment mapping is 2-D";
+    if (srcType.getDimSize(0) != sizeM || srcType.getDimSize(1) != sizeN)
+      return emitOpError() << "seeds a [" << sizeM << "][" << sizeN
+                           << "] accumulator from memref[" << srcType.getDimSize(0)
+                           << "][" << srcType.getDimSize(1)
+                           << "], which is not the same size";
+  }
   return success();
 }
 

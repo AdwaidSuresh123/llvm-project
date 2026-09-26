@@ -1523,6 +1523,71 @@ static Value truncF32ToBf16(ImplicitLocOpBuilder &b, Value f32Val,
   return LLVM::BitcastOp::create(b, bf16Ty, narrow);
 }
 
+/// Walks the wgmma accumulator fragment layout of ONE inner struct -- the
+/// 64-row tile a single warpgroup owns -- invoking `cb(structIndex, idx, idy)`
+/// once per ADJACENT REGISTER PAIR: struct fields `structIndex` and
+/// `structIndex + 1` hold the elements at `(idx, idy)` and `(idx, idy + 1)`.
+/// `idx` and `idy` are i32; callers index-cast them themselves.
+///
+/// Both directions MUST take their addresses from here. The store writes the
+/// registers out through this mapping and a seeded
+/// `warpgroup.mma.init.accumulator` reads them back in through it, so the two
+/// are exact inverses: a layout change that reached only one of them would
+/// silently transpose the accumulator rather than fail to build.
+static void forEachAccumulatorFragment(
+    ImplicitLocOpBuilder &b, LLVM::LLVMStructType structType, int offset,
+    llvm::function_ref<void(size_t, Value, Value)> cb) {
+  Type i32 = b.getI32Type();
+
+  auto makeConst = [&](int32_t index) -> Value {
+    return LLVM::ConstantOp::create(b, i32, b.getI32IntegerAttr(index));
+  };
+  Value c2 = makeConst(2);
+  Value c4 = makeConst(4);
+  Value c8 = makeConst(8);
+  Value c16 = makeConst(16);
+  Value warpSize = makeConst(kWarpSize);
+
+  auto makeMul = [&](Value lhs, Value rhs) -> Value {
+    return LLVM::MulOp::create(b, lhs.getType(), lhs, rhs);
+  };
+  auto makeAdd = [&](Value lhs, Value rhs) -> Value {
+    return LLVM::AddOp::create(b, lhs.getType(), lhs, rhs);
+  };
+
+  // Rows are relative to this warpgroup's own tile, which the destination
+  // view already points at.
+  Value tidx = LLVM::URemOp::create(b, i32, NVVM::ThreadIdXOp::create(b, i32),
+                                    makeConst(4 * kWarpSize));
+  Value laneId = LLVM::URemOp::create(b, i32, tidx, warpSize);
+  Value warpId = LLVM::UDivOp::create(b, i32, tidx, warpSize);
+  Value lane4Id = LLVM::UDivOp::create(b, i32, laneId, c4);
+  Value lane4modId = LLVM::URemOp::create(b, i32, laneId, c4);
+
+  Value tj = makeMul(lane4modId, c2);
+  Value ti = makeAdd(lane4Id, makeMul(warpId, c16));
+  if (offset)
+    ti = makeAdd(ti, makeConst(offset));
+
+  // Number of 32-bit registers owns per thread
+  constexpr unsigned numAdjacentRegisters = 2;
+  // Number of 8x8 matrices one below another per warp
+  constexpr unsigned numStackedMatrices = 2;
+
+  size_t pairCount = (structType.getBody().size() /
+                      (numStackedMatrices * numAdjacentRegisters));
+
+  for (size_t i = 0; i < numStackedMatrices; ++i) {
+    Value idx = makeAdd(ti, makeMul(makeConst(i), c8));
+    for (size_t j = 0; j < pairCount; ++j) {
+      Value idy = makeAdd(tj, makeMul(makeConst(j), c8));
+      size_t structIndex = (i * numAdjacentRegisters) +
+                           (j * (numStackedMatrices * numAdjacentRegisters));
+      cb(structIndex, idx, idy);
+    }
+  }
+}
+
 struct NVGPUWarpgroupMmaStoreOpLowering
     : public ConvertOpToLLVMPattern<nvgpu::WarpgroupMmaStoreOp> {
   using ConvertOpToLLVMPattern<
@@ -1573,82 +1638,62 @@ struct NVGPUWarpgroupMmaStoreOpLowering
                              TypedValue<MemRefType> dstMemref, int offset,
                              Type dstElemTy, bool accumulate) const {
     Type i32 = b.getI32Type();
+    Value c1 = LLVM::ConstantOp::create(b, i32, b.getI32IntegerAttr(1));
 
-    auto makeConst = [&](int32_t index) -> Value {
-      return LLVM::ConstantOp::create(b, i32, b.getI32IntegerAttr(index));
-    };
-    Value c1 = makeConst(1);
-    Value c2 = makeConst(2);
-    Value c4 = makeConst(4);
-    Value c8 = makeConst(8);
-    Value c16 = makeConst(16);
-    Value warpSize = makeConst(kWarpSize);
-
-    auto makeMul = [&](Value lhs, Value rhs) -> Value {
-      return LLVM::MulOp::create(b, lhs.getType(), lhs, rhs);
-    };
-    auto makeAdd = [&](Value lhs, Value rhs) -> Value {
-      return LLVM::AddOp::create(b, lhs.getType(), lhs, rhs);
-    };
-
-    // One accumulator register -> one destination element. `frag` is f32;
-    // the destination may be f32 or bf16, and may need the old value folded
-    // in (accumulate).
-    auto emitElement = [&](Value frag, Value idx, Value idy,
-                           TypedValue<::mlir::MemRefType> memref) {
+    // One accumulator register -> one destination value. `frag` is f32; the
+    // destination may be f32 or bf16, and `old` (accumulate only, else null)
+    // is folded in.
+    auto finish = [&](Value frag, Value old) -> Value {
       Value v = frag;
-      if (accumulate) {
-        Value old = memref::LoadOp::create(b, memref, ValueRange{idx, idy});
+      if (old) {
         if (!dstElemTy.isF32())
           old = arith::ExtFOp::create(b, b.getF32Type(), old);
         v = arith::AddFOp::create(b, v, old);
       }
-      Value out = dstElemTy.isF32() ? v : truncF32ToBf16(b, v, dstElemTy);
-      memref::StoreOp::create(b, out, memref, ValueRange{idx, idy});
+      return dstElemTy.isF32() ? v : truncF32ToBf16(b, v, dstElemTy);
     };
 
-    auto makeExtractAndStore = [&](int i, Value wgmmaResult, Value x, Value y,
-                                   TypedValue<::mlir::MemRefType> memref) {
-      Type it = b.getIndexType();
-      Value idx = arith::IndexCastOp::create(b, it, x);
-      Value idy0 = arith::IndexCastOp::create(b, it, y);
-      Value idy1 = arith::IndexCastOp::create(b, it, makeAdd(y, c1));
-      Value d0 = LLVM::ExtractValueOp::create(b, wgmmaResult, i);
-      Value d1 = LLVM::ExtractValueOp::create(b, wgmmaResult, i + 1);
-      emitElement(d0, idx, idy0, memref);
-      emitElement(d1, idx, idy1, memref);
-    };
-
-    Value tidx = NVVM::ThreadIdXOp::create(b, i32);
-    Value laneId = LLVM::URemOp::create(b, i32, tidx, warpSize);
-    Value warpId = LLVM::UDivOp::create(b, i32, tidx, warpSize);
-    Value lane4Id = LLVM::UDivOp::create(b, i32, laneId, c4);
-    Value lane4modId = LLVM::URemOp::create(b, i32, laneId, c4);
-
-    Value tj = makeMul(lane4modId, c2);
-    Value ti = makeAdd(lane4Id, makeMul(warpId, c16));
-    if (offset)
-      ti = makeAdd(ti, makeConst(offset));
+    // A register pair covers two adjacent columns, so a contiguous row takes
+    // it as one 2-wide access (st/ld.v2 once NovaGPUPromoteLoadStoreAlignment
+    // aligns it to its width) instead of two scalar ones.
+    bool pairwise = dstMemref.getType().isLastDimUnitStride();
+    auto pairTy = VectorType::get(2, dstElemTy);
 
     auto structType = cast<LLVM::LLVMStructType>(matrixD.getType());
-
-    // Number of 32-bit registers owns per thread
-    constexpr unsigned numAdjacentRegisters = 2;
-    // Number of 8x8 matrices one below another per warp
-    constexpr unsigned numStackedMatrices = 2;
-
-    size_t storeCount = (structType.getBody().size() /
-                         (numStackedMatrices * numAdjacentRegisters));
-
-    for (size_t i = 0; i < numStackedMatrices; ++i) {
-      Value idx = makeAdd(ti, makeMul(makeConst(i), c8));
-      for (size_t j = 0; j < storeCount; ++j) {
-        Value idy = makeAdd(tj, makeMul(makeConst(j), c8));
-        size_t structIndex = (i * numAdjacentRegisters) +
-                             (j * (numStackedMatrices * numAdjacentRegisters));
-        makeExtractAndStore(structIndex, matrixD, idx, idy, dstMemref);
-      }
-    }
+    forEachAccumulatorFragment(
+        b, structType, offset, [&](size_t i, Value x, Value y) {
+          Type it = b.getIndexType();
+          Value idx = arith::IndexCastOp::create(b, it, x);
+          Value idy0 = arith::IndexCastOp::create(b, it, y);
+          Value d[2] = {
+              LLVM::ExtractValueOp::create(b, matrixD, static_cast<int64_t>(i)),
+              LLVM::ExtractValueOp::create(b, matrixD,
+                                           static_cast<int64_t>(i + 1))};
+          if (pairwise) {
+            Value old[2] = {};
+            if (accumulate) {
+              Value oldPair = vector::LoadOp::create(b, pairTy, dstMemref,
+                                                     ValueRange{idx, idy0});
+              for (int64_t k = 0; k < 2; ++k)
+                old[k] = vector::ExtractOp::create(b, oldPair, k);
+            }
+            Value out = vector::FromElementsOp::create(
+                b, pairTy, ValueRange{finish(d[0], old[0]),
+                                      finish(d[1], old[1])});
+            vector::StoreOp::create(b, out, dstMemref, ValueRange{idx, idy0});
+            return;
+          }
+          Value idy[2] = {idy0,
+                          arith::IndexCastOp::create(
+                              b, it, LLVM::AddOp::create(b, y.getType(), y, c1))};
+          for (size_t k = 0; k < 2; ++k) {
+            Value old = accumulate ? memref::LoadOp::create(
+                                         b, dstMemref, ValueRange{idx, idy[k]})
+                                   : Value();
+            memref::StoreOp::create(b, finish(d[k], old), dstMemref,
+                                    ValueRange{idx, idy[k]});
+          }
+        });
   }
 
   LogicalResult
@@ -1694,18 +1739,69 @@ struct NVGPUWarpgroupMmaInitAccumulatorOpLowering
     Type elemType = cast<LLVM::LLVMStructType>(packStructType.getBody().front())
                         .getBody()
                         .front();
-    Value zero = LLVM::ConstantOp::create(b, elemType, b.getZeroAttr(elemType));
+    // Seeded form: every fragment register is loaded from the element the
+    // matching warpgroup.mma.store would write it back to, so wgmma's
+    // unconditional scale-d = 1 makes the result `src + A * B` and the epilogue
+    // disappears. Unseeded, the registers are zeroed as before.
+    TypedValue<MemRefType> src = op.getSrcMemref();
+    Type srcElemTy = src ? src.getType().getElementType() : Type();
+    if (src && !srcElemTy.isF32() && !srcElemTy.isBF16())
+      return rewriter.notifyMatchFailure(
+          op, "unsupported source element type for a seeded accumulator");
+
+    Value zero;
+    if (!src)
+      zero = LLVM::ConstantOp::create(b, elemType, b.getZeroAttr(elemType));
     Value packStruct = LLVM::PoisonOp::create(b, packStructType);
     SmallVector<Value> innerStructs;
-    // Unpack the structs and set all values to zero
+    int offset = 0;
+    // Unpack the structs and fill them -- from `src`, else with zero.
     for (auto [idx, s] : llvm::enumerate(packStructType.getBody())) {
       auto structType = cast<LLVM::LLVMStructType>(s);
       Value structValue = LLVM::ExtractValueOp::create(b, packStruct, idx);
-      for (unsigned i = 0; i < structType.getBody().size(); ++i) {
-        structValue = LLVM::InsertValueOp::create(b, structType, structValue,
-                                                  zero, ArrayRef<int64_t>({i}));
+      if (src) {
+        Value c1 = LLVM::ConstantOp::create(b, b.getI32Type(),
+                                            b.getI32IntegerAttr(1));
+        // Same pairing as the store: one 2-wide load per register pair when
+        // the row is contiguous.
+        bool pairwise = src.getType().isLastDimUnitStride();
+        auto pairTy = VectorType::get(2, srcElemTy);
+        forEachAccumulatorFragment(
+            b, structType, offset, [&](size_t i, Value x, Value y) {
+              Type it = b.getIndexType();
+              Value row = arith::IndexCastOp::create(b, it, x);
+              Value col0 = arith::IndexCastOp::create(b, it, y);
+              Value vals[2];
+              if (pairwise) {
+                Value pair = vector::LoadOp::create(b, pairTy, src,
+                                                    ValueRange{row, col0});
+                for (int64_t k = 0; k < 2; ++k)
+                  vals[k] = vector::ExtractOp::create(b, pair, k);
+              } else {
+                Value col1 = arith::IndexCastOp::create(
+                    b, it, LLVM::AddOp::create(b, y.getType(), y, c1));
+                vals[0] = memref::LoadOp::create(b, src, ValueRange{row, col0});
+                vals[1] = memref::LoadOp::create(b, src, ValueRange{row, col1});
+              }
+              for (size_t k = 0; k < 2; ++k) {
+                Value v = vals[k];
+                // The accumulator is f32 whatever the source is stored as.
+                if (!srcElemTy.isF32())
+                  v = arith::ExtFOp::create(b, b.getF32Type(), v);
+                structValue = LLVM::InsertValueOp::create(
+                    b, structType, structValue, v,
+                    ArrayRef<int64_t>({static_cast<int64_t>(i + k)}));
+              }
+            });
+      } else {
+        for (unsigned i = 0; i < structType.getBody().size(); ++i) {
+          structValue = LLVM::InsertValueOp::create(
+              b, structType, structValue, zero, ArrayRef<int64_t>({i}));
+        }
       }
       innerStructs.push_back(structValue);
+      // Each inner struct is the next 64-row tile down; mirrors the store.
+      offset += structType.getBody().size();
     }
     // Pack the inner structs into a single struct
     for (auto [idx, matrix] : llvm::enumerate(innerStructs)) {

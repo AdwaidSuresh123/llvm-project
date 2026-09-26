@@ -648,9 +648,27 @@ def NVGPU_WarpgroupMmaInitAccumulatorOp : NVGPU_Op<"warpgroup.mma.init.accumulat
   let description = [{
     This Op generates and initializes the accumulator matrix for 
     `nvgpu.warpgroup.mma` op to perform matrix-multiply-and-accumulate.
+
+    With no operand every fragment register is zeroed, which is the form
+    `D = A * B` needs.
+
+    `srcMemref`, when given, seeds the fragment registers from memory instead:
+    each register is loaded from the element that the matching
+    `nvgpu.warpgroup.mma.store` would write it back to. 
+    The default is zero-filled '-'
+    Use one or the other, never both.
   }];
+  let arguments = (ins Optional<AnyMemRef>:$srcMemref);
   let results = (outs NVGPU_WarpgroupAccumulator:$matrixC);
-  let assemblyFormat = "attr-dict `->` type($matrixC)";
+  let builders = [
+    // Zero-filled accumulator default for a plain `D = A * B`.
+    OpBuilder<(ins "::mlir::Type":$matrixC), [{
+      build($_builder, $_state, matrixC, ::mlir::Value());
+    }]>
+  ];
+  let assemblyFormat = [{
+    (`from` $srcMemref^ `:` type($srcMemref))? attr-dict `->` type($matrixC)
+  }];
   let hasVerifier = 1;
 }
 
