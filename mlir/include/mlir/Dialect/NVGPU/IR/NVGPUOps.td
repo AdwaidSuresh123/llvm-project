@@ -395,6 +395,36 @@ def NVGPU_MBarrierArriveOp : NVGPU_Op<"mbarrier.arrive", []> {
 let assemblyFormat = "$barriers `[` $mbarId `]` attr-dict `:` type($barriers) `->` type($token)";
 }
 
+def NVGPU_MBarrierArriveRemoteOp : NVGPU_Op<"mbarrier.arrive.remote", []> {
+  let summary = "Arrives on the mbarrier of another CTA in the cluster.";
+  let description = [{
+    Performs an arrive-on operation on the `mbarId`-th barrier of `barriers`
+    as it exists in the shared memory of the CTA whose rank in the cluster is
+    `ctaId` (`%cluster_ctarank` numbering). The barrier is addressed at the
+    offset it has in the executing CTA, so every CTA of the cluster must
+    allocate it identically. There is no token: an arrival on a
+    shared::cluster barrier returns none.
+
+    The arrive has the default `.release.cta` semantics, not `.cluster`: it
+    orders this CTA's own prior accesses, which is what releasing a drained
+    buffer stage to a peer's producer needs once those accesses have completed
+    (e.g. after `wgmma.wait_group`), and it avoids a cluster-scope fence on
+    every arrival.
+
+    For more information, see
+    https://docs.nvidia.com/cuda/parallel-thread-execution/#parallel-synchronization-and-communication-instructions-mbarrier-arrive
+
+    Example:
+    ```mlir
+      nvgpu.mbarrier.arrive.remote %barriers[%c0], %rank : !nvgpu.mbarrier.group<memorySpace = #gpu.address_space<workgroup>>
+    ```
+  }];
+  let arguments = (ins NVGPU_MBarrierGroup:$barriers, Index:$mbarId,
+                       I32:$ctaId);
+  let assemblyFormat =
+      "$barriers `[` $mbarId `]` `,` $ctaId attr-dict `:` type($barriers)";
+}
+
 def NVGPU_MBarrierArriveNoCompleteOp : NVGPU_Op<"mbarrier.arrive.nocomplete", []> {
   let summary = "Performs arrive operation on the `nvgpu.mbarrier.arrive.nocomplete` as non-blocking.";
   let description = [{

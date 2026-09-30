@@ -757,6 +757,12 @@ void LaunchOp::build(OpBuilder &builder, OperationState &result,
   // TODO: Allow passing in proper locations here.
   for (unsigned i = 0; i < kNumConfigRegionAttributes; ++i)
     body->addArgument(builder.getIndexType(), result.location);
+  // A cluster size adds the cluster ids and cluster sizes as six more `index`
+  // arguments, ahead of the attributions (getClusterIds / getClusterSize,
+  // getNumConfigRegionAttributes, and the parser all expect them).
+  if (clusterSizeX && clusterSizeY && clusterSizeZ)
+    for (unsigned i = 0; i < 6; ++i)
+      body->addArgument(builder.getIndexType(), result.location);
   // Add WorkGroup & Private attributions to the region arguments.
   for (Type argTy : workgroupAttributions)
     body->addArgument(argTy, result.location);

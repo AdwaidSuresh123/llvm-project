@@ -864,6 +864,31 @@ struct NVGPUMBarrierArriveLowering
   }
 };
 
+/// Lowers `nvgpu.mbarrier.arrive.remote` to `nvvm.mapa` (the peer CTA's address
+/// of the same barrier) and an `nvvm.mbarrier.arrive` on it, at the default CTA
+/// scope (see the op description).
+struct NVGPUMBarrierArriveRemoteLowering
+    : public MBarrierBasePattern<nvgpu::MBarrierArriveRemoteOp> {
+  using MBarrierBasePattern<nvgpu::MBarrierArriveRemoteOp>::MBarrierBasePattern;
+  LogicalResult
+  matchAndRewrite(nvgpu::MBarrierArriveRemoteOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override {
+    ImplicitLocOpBuilder b(op->getLoc(), rewriter);
+    Value barrier =
+        getMbarrierPtr(b, op.getBarriers().getType(), adaptor.getBarriers(),
+                       adaptor.getMbarId(), rewriter);
+    auto sharedClusterPtrType = LLVM::LLVMPointerType::get(
+        op->getContext(),
+        static_cast<unsigned>(NVVM::NVVMMemorySpace::SharedCluster));
+    Value remote = NVVM::MapaOp::create(b, sharedClusterPtrType, barrier,
+                                        adaptor.getCtaId());
+    rewriter.replaceOpWithNewOp<NVVM::MBarrierArriveOp>(
+        op, /*res=*/Type(), remote, /*count=*/Value(), NVVM::MemScopeKind::CTA,
+        /*relaxed=*/false);
+    return success();
+  }
+};
+
 /// Lowers `nvgpu.mbarrier.arrive.nocomplete` to
 /// `nvvm.mbarrier.arrive.nocomplete`
 struct NVGPUMBarrierArriveNoCompleteLowering
@@ -1498,29 +1523,19 @@ struct NVGPUWarpgroupMmaOpLowering
   }
 };
 
-/// f32 -> bf16 (round-to-nearest-even) via integer bit manipulation rather
-/// than `LLVM::FPTruncOp`. NVPTX codegen's SLP vectorizer re-fuses adjacent
-/// scalar truncf ops (as emitted here, two per iteration) into a 2-wide
-/// vector truncation that is known to miscompile on this target. bf16 is
-/// simply the upper 16 bits of an f32, so the conversion reduces to a shift
-/// and a rounding add, avoiding any float-narrowing instruction altogether.
+/// f32 -> bf16 (round-to-nearest-even) via a plain narrowing float-trunc.
 ///
-/// TODO: revisit on each LLVM bump -- once the NVPTX SLP miscompile is fixed
-/// upstream this should go back to a plain LLVM::FPTruncOp.
+/// This used to hand-roll the rounding via integer bit manipulation (shift +
+/// round-add) to dodge a claimed NVPTX SLP-vectorizer miscompile of two
+/// adjacent scalar truncf ops fused into a 2-wide vector truncation. Verified
+/// stale: bit-exact against a round-to-nearest-even reference across 200k+
+/// inputs (exact ties included), even with SLP fusion forced at -O3. A plain
+/// truncf also codegens strictly better -- two adjacent ones fuse into one
+/// `cvt.rn.bf16x2.f32` (1 instruction) versus the old bit-trick's per-pair
+/// bfe/add/add/prmt (7 instructions).
 static Value truncF32ToBf16(ImplicitLocOpBuilder &b, Value f32Val,
                             Type bf16Ty) {
-  Type i32 = b.getI32Type();
-  auto cI32 = [&](int32_t v) -> Value {
-    return LLVM::ConstantOp::create(b, i32, b.getI32IntegerAttr(v));
-  };
-  Value bits = LLVM::BitcastOp::create(b, i32, f32Val);
-  Value hiBit = LLVM::LShrOp::create(b, i32, bits, cI32(16));
-  Value lsb = LLVM::AndOp::create(b, i32, hiBit, cI32(1));
-  Value bias = LLVM::AddOp::create(b, i32, cI32(0x7fff), lsb);
-  Value rounded = LLVM::AddOp::create(b, i32, bits, bias);
-  Value hi16 = LLVM::LShrOp::create(b, i32, rounded, cI32(16));
-  Value narrow = LLVM::TruncOp::create(b, b.getI16Type(), hi16);
-  return LLVM::BitcastOp::create(b, bf16Ty, narrow);
+  return LLVM::FPTruncOp::create(b, bf16Ty, f32Val);
 }
 
 /// Walks the wgmma accumulator fragment layout of ONE inner struct -- the
@@ -2576,6 +2591,7 @@ void mlir::populateNVGPUToNVVMConversionPatterns(
       NVGPUMBarrierInitLowering,             // nvgpu.mbarrier.init
       NVGPUMBarrierGetLowering,              // nvgpu.mbarrier.get
       NVGPUMBarrierArriveLowering,           // nvgpu.mbarrier.arrive
+      NVGPUMBarrierArriveRemoteLowering,     // nvgpu.mbarrier.arrive.remote
       NVGPUMBarrierArriveNoCompleteLowering, // nvgpu.mbarrier.arrive.no_complete
       NVGPUMBarrierTestWaitLowering,         // nvgpu.mbarrier.test_wait_parity
       NVGPUMBarrierTryWaitParityLowering,    // nvgpu.mbarrier.try_wait_parity

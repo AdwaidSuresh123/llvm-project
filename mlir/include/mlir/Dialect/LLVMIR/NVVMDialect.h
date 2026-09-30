@@ -45,8 +45,12 @@ inline bool operator!=(NVVMMemorySpace memSpace, unsigned as) {
   return static_cast<unsigned>(memSpace) != as;
 }
 
-// Shared memory has 128-bit alignment
-constexpr int kSharedMemoryAlignmentBit = 128;
+// Alignment of the dynamic shared memory symbol (gpu.dynamic_shared_memory).
+// 1024 bytes, the strictest any PTX shared-memory operand needs: TMA and wgmma
+// with 128-byte swizzle require 1024-byte-aligned tiles. ptxas places the
+// dynamic region after the kernel's static shared variables at this alignment,
+// so a kernel with static shared memory pays at most 1 KB of padding.
+constexpr int kSharedMemoryAlignmentBit = 1024 * 8;
 
 /// A pair type of LLVM's Intrinsic ID and args (which are llvm values).
 /// This type is returned by the getIntrinsicIDAndArgs() methods.

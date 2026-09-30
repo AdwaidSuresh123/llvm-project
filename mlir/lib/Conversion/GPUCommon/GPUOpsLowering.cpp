@@ -726,8 +726,15 @@ static LLVM::GlobalOp getDynamicSharedMemorySymbol(
   auto zeroSizedArrayType = LLVM::LLVMArrayType::get(
       typeConverter->convertType(memrefType.getElementType()), 0);
 
+  // Dynamic shared memory is the external *declaration* of a zero-sized array:
+  // NVPTX prints it as `.extern .shared .b8 name[]`, whose storage the launch
+  // supplies after all static shared variables (AMDGPU likewise treats it as
+  // dynamic LDS). With internal linkage it is a definition instead, which
+  // NVPTX emits as a 1-byte static `.shared` variable: ptxas then lays the
+  // kernel's other static shared variables (e.g. mbarriers) out right after
+  // it, inside the buffer the kernel indexes as dynamic shared memory.
   return LLVM::GlobalOp::create(rewriter, op->getLoc(), zeroSizedArrayType,
-                                /*isConstant=*/false, LLVM::Linkage::Internal,
+                                /*isConstant=*/false, LLVM::Linkage::External,
                                 symName, /*value=*/Attribute(), alignmentByte,
                                 addressSpace.value());
 }
