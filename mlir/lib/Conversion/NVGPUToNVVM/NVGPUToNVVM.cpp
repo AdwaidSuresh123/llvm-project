@@ -1651,7 +1651,7 @@ struct NVGPUWarpgroupMmaStoreOpLowering
   /// synchronization: each destination element is owned by exactly one lane.
   void storeFragmentedMatrix(ImplicitLocOpBuilder &b, Value matrixD,
                              TypedValue<MemRefType> dstMemref, int offset,
-                             Type dstElemTy, bool accumulate) const {
+                             Type dstElemTy, bool accumulate, llvm::MaybeAlign pairAlign) const {
     Type i32 = b.getI32Type();
     Value c1 = LLVM::ConstantOp::create(b, i32, b.getI32IntegerAttr(1));
 
@@ -1668,9 +1668,8 @@ struct NVGPUWarpgroupMmaStoreOpLowering
       return dstElemTy.isF32() ? v : truncF32ToBf16(b, v, dstElemTy);
     };
 
-    // A register pair covers two adjacent columns, so a contiguous row takes
-    // it as one 2-wide access (st/ld.v2 once NovaGPUPromoteLoadStoreAlignment
-    // aligns it to its width) instead of two scalar ones.
+    // A register pair covers two adjacent columns, so a contiguous row takes it as one 2-wide access, aligned as
+    // the op's `alignment` promises (st/ld.v2) instead of two scalar ones.
     bool pairwise = dstMemref.getType().isLastDimUnitStride();
     auto pairTy = VectorType::get(2, dstElemTy);
 
@@ -1687,15 +1686,15 @@ struct NVGPUWarpgroupMmaStoreOpLowering
           if (pairwise) {
             Value old[2] = {};
             if (accumulate) {
-              Value oldPair = vector::LoadOp::create(b, pairTy, dstMemref,
-                                                     ValueRange{idx, idy0});
+              Value oldPair = vector::LoadOp::create(b, pairTy, dstMemref, ValueRange{idx, idy0},
+                                                     /*nontemporal=*/false, pairAlign);
               for (int64_t k = 0; k < 2; ++k)
                 old[k] = vector::ExtractOp::create(b, oldPair, k);
             }
             Value out = vector::FromElementsOp::create(
                 b, pairTy, ValueRange{finish(d[0], old[0]),
                                       finish(d[1], old[1])});
-            vector::StoreOp::create(b, out, dstMemref, ValueRange{idx, idy0});
+            vector::StoreOp::create(b, out, dstMemref, ValueRange{idx, idy0}, /*nontemporal=*/false, pairAlign);
             return;
           }
           Value idy[2] = {idy0,
@@ -1732,8 +1731,8 @@ struct NVGPUWarpgroupMmaStoreOpLowering
       auto structType = cast<LLVM::LLVMStructType>(matrixD);
       Value innerStructValue =
           LLVM::ExtractValueOp::create(b, matriDValue, idx);
-      storeFragmentedMatrix(b, innerStructValue, op.getDstMemref(), offset,
-                            dstElemTy, accumulate);
+      storeFragmentedMatrix(b, innerStructValue, op.getDstMemref(), offset, dstElemTy, accumulate,
+                            llvm::MaybeAlign(op.getAlignment().value_or(0)));
       offset += structType.getBody().size();
     }
     rewriter.eraseOp(op);
@@ -1781,6 +1780,7 @@ struct NVGPUWarpgroupMmaInitAccumulatorOpLowering
         // the row is contiguous.
         bool pairwise = src.getType().isLastDimUnitStride();
         auto pairTy = VectorType::get(2, srcElemTy);
+        llvm::MaybeAlign pairAlign(op.getAlignment().value_or(0));
         forEachAccumulatorFragment(
             b, structType, offset, [&](size_t i, Value x, Value y) {
               Type it = b.getIndexType();
@@ -1788,8 +1788,8 @@ struct NVGPUWarpgroupMmaInitAccumulatorOpLowering
               Value col0 = arith::IndexCastOp::create(b, it, y);
               Value vals[2];
               if (pairwise) {
-                Value pair = vector::LoadOp::create(b, pairTy, src,
-                                                    ValueRange{row, col0});
+                Value pair = vector::LoadOp::create(b, pairTy, src, ValueRange{row, col0}, /*nontemporal=*/false,
+                                                    pairAlign);
                 for (int64_t k = 0; k < 2; ++k)
                   vals[k] = vector::ExtractOp::create(b, pair, k);
               } else {

@@ -660,11 +660,21 @@ def NVGPU_WarpgroupMmaStoreOp : NVGPU_Op<"warpgroup.mma.store"> {
 
     `accumulate`, if set, adds the fragmented result onto the existing
     `dstMemref` value instead of overwriting it.
+
+    `alignment`, if set, is the caller's promise of the byte alignment of each
+    register pair's address (two adjacent columns); the pair is then accessed as
+    one 2-wide vector. Without it each access gets element alignment.
   }];
 
   let arguments = (ins NVGPU_WarpgroupAccumulator:$matrixD,
                        Arg<AnyMemRef, "", [MemRead, MemWrite]>:$dstMemref,
-                       UnitAttr:$accumulate);
+                       UnitAttr:$accumulate,
+                       OptionalAttr<IntValidAlignment<I64Attr>>:$alignment);
+  let builders = [
+    OpBuilder<(ins "::mlir::Value":$matrixD, "::mlir::Value":$dstMemref), [{
+      build($_builder, $_state, matrixD, dstMemref, ::mlir::UnitAttr(), ::mlir::IntegerAttr());
+    }]>
+  ];
   
   let assemblyFormat = [{
     $matrixD `,` $dstMemref attr-dict `:` type($matrixD) `to` type($dstMemref)
@@ -687,13 +697,21 @@ def NVGPU_WarpgroupMmaInitAccumulatorOp : NVGPU_Op<"warpgroup.mma.init.accumulat
     `nvgpu.warpgroup.mma.store` would write it back to. 
     The default is zero-filled '-'
     Use one or the other, never both.
+
+    `alignment`, as on `nvgpu.warpgroup.mma.store`, promises the byte alignment
+    of each register pair's address in `srcMemref`.
   }];
-  let arguments = (ins Optional<AnyMemRef>:$srcMemref);
+  let arguments = (ins Optional<AnyMemRef>:$srcMemref,
+                       OptionalAttr<IntValidAlignment<I64Attr>>:$alignment);
   let results = (outs NVGPU_WarpgroupAccumulator:$matrixC);
   let builders = [
     // Zero-filled accumulator default for a plain `D = A * B`.
     OpBuilder<(ins "::mlir::Type":$matrixC), [{
-      build($_builder, $_state, matrixC, ::mlir::Value());
+      build($_builder, $_state, matrixC, ::mlir::Value(), ::mlir::IntegerAttr());
+    }]>,
+    // Seeded from `srcMemref` (null: zero-filled), alignment unset.
+    OpBuilder<(ins "::mlir::Type":$matrixC, "::mlir::Value":$srcMemref), [{
+      build($_builder, $_state, matrixC, srcMemref, ::mlir::IntegerAttr());
     }]>
   ];
   let assemblyFormat = [{
