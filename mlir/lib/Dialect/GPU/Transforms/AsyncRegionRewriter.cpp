@@ -33,6 +33,10 @@ using namespace mlir;
 namespace {
 class GpuAsyncRegionPass
     : public impl::GpuAsyncRegionPassBase<GpuAsyncRegionPass> {
+public:
+  using Base::Base;
+
+private:
   struct ThreadTokenCallback;
   struct DeferWaitCallback;
   struct SingleTokenUseCallback;
@@ -48,7 +52,8 @@ static bool hasSideEffects(Operation *op) { return !isMemoryEffectFree(op); }
 // Region walk callback which makes GPU ops implementing the AsyncOpInterface
 // execute asynchronously.
 struct GpuAsyncRegionPass::ThreadTokenCallback {
-  ThreadTokenCallback(MLIRContext &context) : builder(&context) {}
+  ThreadTokenCallback(MLIRContext &context, bool syncOnReturn)
+      : builder(&context), syncOnReturn(syncOnReturn) {}
 
   WalkResult operator()(Block *block) {
     for (Operation &op : make_early_inc_range(*block)) {
@@ -81,6 +86,11 @@ private:
       return rewriteAsyncOp(asyncOp); // Replace GPU op with async version.
     if (!currentToken)
       return success();
+    // Without sync-on-return, the caller synchronizes with the function's GPU work.
+    if (!syncOnReturn && isa<func::ReturnOp>(op)) {
+      currentToken = {};
+      return success();
+    }
     // Insert host synchronization before terminator or op with side effects.
     if (isTerminator(op) || hasSideEffects(op))
       currentToken = createWaitOp(op->getLoc(), Type(), {currentToken});
@@ -134,6 +144,7 @@ private:
   }
 
   OpBuilder builder;
+  bool syncOnReturn;
 
   // The token that represents the current asynchronous dependency. It's valid
   // range starts with a `gpu.wait async` op, and ends with a `gpu.wait` op.
@@ -337,7 +348,9 @@ struct GpuAsyncRegionPass::SingleTokenUseCallback {
 // inserts the necessary synchronization (as gpu.wait ops). Assumes sequential
 // execution semantics and that no GPU ops are asynchronous yet.
 void GpuAsyncRegionPass::runOnOperation() {
-  if (getOperation()->walk(ThreadTokenCallback(getContext())).wasInterrupted())
+  if (getOperation()
+          ->walk(ThreadTokenCallback(getContext(), syncOnReturn))
+          .wasInterrupted())
     return signalPassFailure();
 
   // Collect gpu.wait ops that we can move out of async.execute regions.
