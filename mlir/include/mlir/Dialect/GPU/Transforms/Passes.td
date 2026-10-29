@@ -28,6 +28,10 @@ def GpuKernelOutliningPass : Pass<"gpu-kernel-outlining", "ModuleOp"> {
 def GpuAsyncRegionPass : Pass<"gpu-async-region", "func::FuncOp"> {
   let summary = "Make GPU ops async";
   let dependentDialects = ["async::AsyncDialect"];
+  let options = [Option<"syncOnReturn", "sync-on-return", "bool",
+                        /*default=*/"true",
+                        "Host-synchronize before the function returns. When "
+                        "false, the caller synchronizes with the GPU work.">];
 }
 
 def GpuMapParallelLoopsPass
